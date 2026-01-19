@@ -45,20 +45,34 @@ class TransformerBlock(GradientCheckpointingLayer):
         self.config = config
         self.layer_idx = layer_idx
 
-        self.attn_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
+        if config.fuse_norm:
+            self.attn_norm = RMSNorm(config.hidden_size, eps=config.norm_eps,
+                                      zero_centered_gamma=config.zero_centered_gamma)
+        else:
+            self.attn_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.attn = Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_heads,
             num_kv_heads=config.num_kv_heads,
             qkv_bias=config.qkv_bias,
             qk_norm=config.qk_norm,
+            norm_eps=config.norm_eps,
             window_size=config.window_size,
             rope_theta=config.rope_theta,
             max_position_embeddings=config.max_position_embeddings,
             layer_idx=layer_idx,
+            use_output_gate=config.use_output_gate,
+            gate_fn=config.gate_fn,
+            zero_centered_gamma=config.zero_centered_gamma,
+            rotary_dim=config.rotary_dim,
+            rotary_percent=config.rotary_percent,
         )
 
-        self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
+        if config.fuse_norm:
+            self.mlp_norm = RMSNorm(config.hidden_size, eps=config.norm_eps,
+                                     zero_centered_gamma=config.zero_centered_gamma)
+        else:
+            self.mlp_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.mlp = TransformerMLP(
             hidden_size=config.hidden_size,
             hidden_ratio=config.hidden_ratio,
@@ -169,7 +183,11 @@ class TransformerModel(TransformerPreTrainedModel):
 
         self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList([TransformerBlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
-        self.norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
+        if config.fuse_norm:
+            self.norm = RMSNorm(config.hidden_size, eps=config.norm_eps,
+                                 zero_centered_gamma=config.zero_centered_gamma)
+        else:
+            self.norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
 
         self.gradient_checkpointing = False
 

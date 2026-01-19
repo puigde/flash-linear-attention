@@ -23,6 +23,11 @@ class TransformerConfig(PretrainedConfig):
         num_kv_heads: int | None = None,
         qkv_bias: bool = False,
         qk_norm: bool = False,
+        use_output_gate: bool = False,
+        gate_fn: str = "sigmoid",
+        zero_centered_gamma: bool = False,
+        rotary_dim: int | None = None,
+        rotary_percent: float | None = None,
         window_size: int | None = None,
         rope_theta: float | None = 10000.,
         max_position_embeddings: int = 2048,
@@ -51,6 +56,11 @@ class TransformerConfig(PretrainedConfig):
         self.num_kv_heads = num_kv_heads
         self.qkv_bias = qkv_bias
         self.qk_norm = qk_norm
+        self.use_output_gate = use_output_gate
+        self.gate_fn = gate_fn
+        self.zero_centered_gamma = zero_centered_gamma
+        self.rotary_dim = rotary_dim
+        self.rotary_percent = rotary_percent
         self.window_size = window_size
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -81,6 +91,13 @@ class TransformerConfig(PretrainedConfig):
                 "at the potential cost of reduced precision. "
                 "If you observe issues like loss divergence, consider disabling this setting.",
             )
+        if zero_centered_gamma and not fuse_norm:
+            raise ValueError(
+                "`zero_centered_gamma=True` requires `fuse_norm=True`. "
+                "PyTorch's nn.RMSNorm does not support zero-centered gamma.",
+            )
+        if use_output_gate and gate_fn not in ('sigmoid', 'silu', 'swish'):
+            raise ValueError(f"Unsupported gate function: {gate_fn}. Supported: 'sigmoid', 'silu', 'swish'")
 
         super().__init__(
             pad_token_id=pad_token_id,
