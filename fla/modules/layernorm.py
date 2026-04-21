@@ -187,7 +187,7 @@ class GroupNormRef(nn.Module):
         for BT in [32, 64, 128]
         for num_warps in [2, 4, 8]
     ],
-    key=['D', 'NB', 'HAS_RESIDUAL', 'STORE_RESIDUAL_OUT', 'IS_RMS_NORM'],
+    key=['D', 'NB', 'HAS_RESIDUAL', 'STORE_RESIDUAL_OUT', 'IS_RMS_NORM', 'ZERO_CENTERED_GAMMA'],
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -212,6 +212,7 @@ def layer_norm_fwd_kernel(
     STORE_RESIDUAL_OUT: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    ZERO_CENTERED_GAMMA: tl.constexpr = False,
 ):
     i_t = tl.program_id(0)
 
@@ -247,7 +248,13 @@ def layer_norm_fwd_kernel(
     if HAS_BIAS:
         b_b = tl.load(b + o_g[:, None] * D + o_d[None, :], mask=m_d[None, :]).to(tl.float32)
     b_x_hat = (b_x - b_mean[:, None]) * b_rstd[:, None] if not IS_RMS_NORM else b_x * b_rstd[:, None]
-    b_y = b_x_hat * b_w if HAS_WEIGHT else b_x_hat
+    if HAS_WEIGHT:
+        if ZERO_CENTERED_GAMMA:
+            b_y = b_x_hat * (1.0 + b_w)
+        else:
+            b_y = b_x_hat * b_w
+    else:
+        b_y = b_x_hat
     if HAS_BIAS:
         b_y = b_y + b_b
 
@@ -261,7 +268,7 @@ def layer_norm_fwd_kernel(
         triton.Config({}, num_warps=num_warps)
         for num_warps in [2, 4, 8, 16]
     ],
-    key=['D', 'HAS_RESIDUAL', 'STORE_RESIDUAL_OUT', 'IS_RMS_NORM'],
+    key=['D', 'HAS_RESIDUAL', 'STORE_RESIDUAL_OUT', 'IS_RMS_NORM', 'ZERO_CENTERED_GAMMA'],
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -283,6 +290,7 @@ def layer_norm_fwd_kernel1(
     STORE_RESIDUAL_OUT: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    ZERO_CENTERED_GAMMA: tl.constexpr = False,
 ):
     i_t = tl.program_id(0)
     i_g = i_t % G
@@ -317,7 +325,13 @@ def layer_norm_fwd_kernel1(
     if HAS_BIAS:
         b_b = tl.load(b + i_g * D + o_d, mask=m_d).to(tl.float32)
     b_x_hat = (b_x - b_mean) * b_rstd if not IS_RMS_NORM else b_x * b_rstd
-    b_y = b_x_hat * b_w if HAS_WEIGHT else b_x_hat
+    if HAS_WEIGHT:
+        if ZERO_CENTERED_GAMMA:
+            b_y = b_x_hat * (1.0 + b_w)
+        else:
+            b_y = b_x_hat * b_w
+    else:
+        b_y = b_x_hat
     if HAS_BIAS:
         b_y = b_y + b_b
 
@@ -334,7 +348,7 @@ def layer_norm_fwd_kernel1(
         for BT in [32, 64]
         for num_warps in [2, 4, 8]
     ],
-    key=['D', 'NB', 'HAS_DRESIDUAL', 'STORE_DRESIDUAL', 'IS_RMS_NORM'],
+    key=['D', 'NB', 'HAS_DRESIDUAL', 'STORE_DRESIDUAL', 'IS_RMS_NORM', 'ZERO_CENTERED_GAMMA'],
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -365,6 +379,7 @@ def layer_norm_bwd_kernel(
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     RECOMPUTE_OUTPUT: tl.constexpr,
+    ZERO_CENTERED_GAMMA: tl.constexpr = False,
 ):
     i_s = tl.program_id(0)
     i_g, i_sg = i_s // GS, i_s % GS
@@ -401,7 +416,13 @@ def layer_norm_bwd_kernel(
         b_xhat = (b_x - b_mean[:, None]) * b_rstd[:, None] if not IS_RMS_NORM else b_x * b_rstd[:, None]
         b_xhat = tl.where(m_d[None, :], b_xhat, 0.0)
 
-        b_y = b_xhat * b_w[None, :] if HAS_WEIGHT else b_xhat
+        if HAS_WEIGHT:
+            if ZERO_CENTERED_GAMMA:
+                b_y = b_xhat * (1.0 + b_w[None, :])
+            else:
+                b_y = b_xhat * b_w[None, :]
+        else:
+            b_y = b_xhat
         if HAS_BIAS:
             b_y = b_y + b_b[None, :]
         if RECOMPUTE_OUTPUT:
@@ -415,7 +436,10 @@ def layer_norm_bwd_kernel(
             # mask to this program's upper bound to avoid double-counting dw/db.
             m_t = (i_t + tl.arange(0, BT)) < min(i_sg * BS + BS, Tg)
         if HAS_WEIGHT:
-            b_wdy = b_dy * b_w
+            if ZERO_CENTERED_GAMMA:
+                b_wdy = b_dy * (1.0 + b_w)
+            else:
+                b_wdy = b_dy * b_w
             b_dw += tl.where(m_t[:, None], b_dy * b_xhat, 0.0)
         if HAS_BIAS:
             b_db += tl.where(m_t[:, None], b_dy, 0.0)
@@ -451,7 +475,7 @@ def layer_norm_bwd_kernel(
         triton.Config({}, num_warps=num_warps)
         for num_warps in [2, 4, 8]
     ],
-    key=['D', 'HAS_DRESIDUAL', 'STORE_DRESIDUAL', 'IS_RMS_NORM'],
+    key=['D', 'HAS_DRESIDUAL', 'STORE_DRESIDUAL', 'IS_RMS_NORM', 'ZERO_CENTERED_GAMMA'],
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -480,6 +504,7 @@ def layer_norm_bwd_kernel1(
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     RECOMPUTE_OUTPUT: tl.constexpr,
+    ZERO_CENTERED_GAMMA: tl.constexpr = False,
 ):
     i_s = tl.program_id(0)
     i_g, i_sg = i_s // GS, i_s % GS
@@ -506,13 +531,22 @@ def layer_norm_bwd_kernel1(
         b_xhat = (b_x - b_mean) * b_rstd if not IS_RMS_NORM else b_x * b_rstd
         b_xhat = tl.where(mask, b_xhat, 0.0)
         if RECOMPUTE_OUTPUT:
-            b_y = b_xhat * b_w if HAS_WEIGHT else b_xhat
+            if HAS_WEIGHT:
+                if ZERO_CENTERED_GAMMA:
+                    b_y = b_xhat * (1.0 + b_w)
+                else:
+                    b_y = b_xhat * b_w
+            else:
+                b_y = b_xhat
             if HAS_BIAS:
                 b_y = b_y + b_b
             tl.store(y + i_t * D + o_d, b_y, mask=mask)
         b_wdy = b_dy
         if HAS_WEIGHT:
-            b_wdy = b_dy * b_w
+            if ZERO_CENTERED_GAMMA:
+                b_wdy = b_dy * (1.0 + b_w)
+            else:
+                b_wdy = b_dy * b_w
             b_dw += b_dy * b_xhat
         if HAS_BIAS:
             b_db += b_dy
@@ -548,6 +582,7 @@ def layer_norm_fwd(
     residual_dtype: torch.dtype = None,
     is_rms_norm: bool = False,
     num_groups: int = 1,
+    zero_centered_gamma: bool = False,
 ):
     if residual is not None:
         residual_dtype = residual.dtype
@@ -596,6 +631,7 @@ def layer_norm_fwd(
             STORE_RESIDUAL_OUT=res_out is not None,
             HAS_WEIGHT=weight is not None,
             HAS_BIAS=bias is not None,
+            ZERO_CENTERED_GAMMA=zero_centered_gamma,
         )
     else:
         layer_norm_fwd_kernel1[(T,)](
@@ -615,6 +651,7 @@ def layer_norm_fwd(
             HAS_RESIDUAL=residual is not None,
             STORE_RESIDUAL_OUT=res_out is not None,
             HAS_WEIGHT=weight is not None,
+            ZERO_CENTERED_GAMMA=zero_centered_gamma,
             HAS_BIAS=bias is not None,
         )
     # res_out is None if residual is None and residual_dtype == input_dtype
@@ -634,6 +671,7 @@ def layer_norm_bwd(
     x_dtype: torch.dtype = None,
     recompute_output: bool = False,
     num_groups: int = 1,
+    zero_centered_gamma: bool = False,
 ):
     T, D, G = *x.shape, num_groups
     assert dy.shape == (T, D)
@@ -692,6 +730,7 @@ def layer_norm_bwd(
             STORE_DRESIDUAL=dres_in is not None,
             HAS_WEIGHT=weight is not None,
             HAS_BIAS=bias is not None,
+            ZERO_CENTERED_GAMMA=zero_centered_gamma,
         )
     else:
         layer_norm_bwd_kernel1[grid](
@@ -718,6 +757,7 @@ def layer_norm_bwd(
             STORE_DRESIDUAL=dres_in is not None,
             HAS_WEIGHT=weight is not None,
             HAS_BIAS=bias is not None,
+            ZERO_CENTERED_GAMMA=zero_centered_gamma,
         )
     dw = dw.view(G, -1, D).sum(1).to(weight).view_as(weight) if weight is not None else None
     db = db.view(G, -1, D).sum(1).to(bias).view_as(bias) if bias is not None else None
@@ -742,6 +782,7 @@ class LayerNormFunction(torch.autograd.Function):
         residual_in_fp32: bool = False,
         is_rms_norm: bool = False,
         num_groups: int = 1,
+        zero_centered_gamma: bool = False,
     ):
         x_shape_og = x.shape
 
@@ -766,6 +807,7 @@ class LayerNormFunction(torch.autograd.Function):
             residual_dtype=residual_dtype,
             is_rms_norm=is_rms_norm,
             num_groups=num_groups,
+            zero_centered_gamma=zero_centered_gamma,
         )
         ctx.save_for_backward(res_out, weight, bias, mean, rstd)
         ctx.x_shape_og = x_shape_og
@@ -775,6 +817,7 @@ class LayerNormFunction(torch.autograd.Function):
         ctx.has_residual = residual is not None
         ctx.prenorm = prenorm
         ctx.x_dtype = x.dtype
+        ctx.zero_centered_gamma = zero_centered_gamma
         y = y.reshape(x_shape_og)
         return y if not prenorm else (y, res_out.reshape(x_shape_og))
 
@@ -802,6 +845,7 @@ class LayerNormFunction(torch.autograd.Function):
             ctx.is_rms_norm,
             x_dtype=ctx.x_dtype,
             num_groups=ctx.num_groups,
+            zero_centered_gamma=ctx.zero_centered_gamma,
         )
         return (
             dx.reshape(ctx.x_shape_og),
@@ -813,6 +857,7 @@ class LayerNormFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,  # zero_centered_gamma
         )
 
 
@@ -870,6 +915,7 @@ def rms_norm(
     eps: float = 1e-5,
     prenorm: bool = False,
     residual_in_fp32: bool = False,
+    zero_centered_gamma: bool = False,
 ):
     return LayerNormFunction.apply(
         x,
@@ -880,6 +926,8 @@ def rms_norm(
         prenorm,
         residual_in_fp32,
         True,
+        1,  # num_groups
+        zero_centered_gamma,
     )
 
 
@@ -1089,6 +1137,7 @@ class RMSNorm(nn.Module):
         elementwise_affine: bool = True,
         bias: bool = False,
         eps: float = 1e-5,
+        zero_centered_gamma: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> RMSNorm:
@@ -1098,6 +1147,7 @@ class RMSNorm(nn.Module):
         self.hidden_size = hidden_size
         self.elementwise_affine = elementwise_affine
         self.eps = eps
+        self.zero_centered_gamma = zero_centered_gamma
 
         self.register_parameter("weight", None)
         self.register_parameter("bias", None)
@@ -1110,7 +1160,10 @@ class RMSNorm(nn.Module):
 
     def reset_parameters(self):
         if self.elementwise_affine:
-            nn.init.ones_(self.weight)
+            if self.zero_centered_gamma:
+                nn.init.zeros_(self.weight)
+            else:
+                nn.init.ones_(self.weight)
             if self.bias is not None:
                 nn.init.zeros_(self.bias)
 
@@ -1119,6 +1172,8 @@ class RMSNorm(nn.Module):
         if not self.elementwise_affine:
             s += f", elementwise_affine={self.elementwise_affine}"
         s += f", eps={self.eps}"
+        if self.zero_centered_gamma:
+            s += f", zero_centered_gamma={self.zero_centered_gamma}"
         s += ")"
         return s
 
@@ -1131,6 +1186,7 @@ class RMSNorm(nn.Module):
             eps=self.eps,
             prenorm=prenorm,
             residual_in_fp32=residual_in_fp32,
+            zero_centered_gamma=self.zero_centered_gamma,
         )
 
 

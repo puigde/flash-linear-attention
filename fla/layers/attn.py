@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 from transformers.utils import logging
 
@@ -43,10 +44,16 @@ class Attention(nn.Module):
         num_kv_heads: int | None = None,
         qkv_bias: bool = False,
         qk_norm: bool = False,
+        norm_eps: float = 1e-5,
         window_size: int | None = None,
         rope_theta: float | None = 10000.,
         max_position_embeddings: int | None = None,
         layer_idx: int = None,
+        use_output_gate: bool = False,
+        gate_fn: str = "sigmoid",
+        zero_centered_gamma: bool = False,
+        rotary_dim: int | None = None,
+        rotary_percent: float | None = None,
     ):
         super().__init__()
 
@@ -66,6 +73,30 @@ class Attention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.layer_idx = layer_idx
+        self.use_output_gate = use_output_gate
+        self.gate_fn = gate_fn
+
+        # Validate gate function early
+        if use_output_gate and gate_fn not in ('sigmoid', 'silu', 'swish'):
+            raise ValueError(f"Unsupported gate function: {gate_fn}. Supported: 'sigmoid', 'silu', 'swish'")
+
+        # Compute rotary_dim for partial RoPE
+        if rotary_dim is not None:
+            self.rotary_dim = rotary_dim
+        elif rotary_percent is not None:
+            self.rotary_dim = int(self.head_dim * rotary_percent)
+            self.rotary_dim -= self.rotary_dim % 2  # ensure even
+        else:
+            self.rotary_dim = self.head_dim
+
+        # Validate rotary_dim bounds
+        if rope_theta is not None:  # Only validate if RoPE is enabled
+            if self.rotary_dim <= 0:
+                raise ValueError(f"rotary_dim must be positive, got {self.rotary_dim}")
+            if self.rotary_dim > self.head_dim:
+                raise ValueError(f"rotary_dim ({self.rotary_dim}) cannot exceed head_dim ({self.head_dim})")
+            if self.rotary_dim % 2 != 0:
+                raise ValueError(f"rotary_dim must be even, got {self.rotary_dim}")
 
         if flash_attn_func is None:
             raise ImportError("Please install Flash Attention via `pip install flash-attn --no-build-isolation` first")
@@ -75,11 +106,21 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=self.qkv_bias)
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
 
-        if qk_norm:
-            self.q_norm = RMSNorm(self.head_dim, dtype=torch.float32)
-            self.k_norm = RMSNorm(self.head_dim, dtype=torch.float32)
+        # Output gate projection
+        if use_output_gate:
+            self.g_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=qkv_bias)
+        else:
+            self.g_proj = None
 
-        self.rotary = RotaryEmbedding(dim=self.head_dim, base=self.rope_theta)
+        if qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, eps=norm_eps, dtype=torch.float32, zero_centered_gamma=zero_centered_gamma)
+            self.k_norm = RMSNorm(self.head_dim, eps=norm_eps, dtype=torch.float32, zero_centered_gamma=zero_centered_gamma)
+
+        # Rotary embedding (None if rope_theta is None)
+        if rope_theta is not None:
+            self.rotary = RotaryEmbedding(dim=self.rotary_dim, base=self.rope_theta)
+        else:
+            self.rotary = None
 
     def forward(
         self,
@@ -121,7 +162,8 @@ class Attention(nn.Module):
 
         if self.max_position_embeddings is not None:
             max_seqlen = max(max_seqlen, self.max_position_embeddings)
-        q, k = self.rotary(q, k, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen, cu_seqlens=cu_seqlens)
+        if self.rotary is not None:
+            q, k = self.rotary(q, k, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen, cu_seqlens=cu_seqlens)
 
         if past_key_values is not None:
             cache_has_content = past_key_values.get_seq_length(self.layer_idx) > 0
@@ -172,6 +214,17 @@ class Attention(nn.Module):
                 causal=True,
                 window_size=(-1, -1) if self.window_size is None else (self.window_size-1, 0),
             )
+
+        # Apply output gate if enabled
+        if self.g_proj is not None:
+            gate = rearrange(self.g_proj(hidden_states), 'b s (h d) -> b s h d', h=self.num_heads)
+            if self.gate_fn == 'sigmoid':
+                o = o * torch.sigmoid(gate.float()).to(o.dtype)
+            elif self.gate_fn == 'silu' or self.gate_fn == 'swish':
+                o = o * F.silu(gate.float()).to(o.dtype)
+            else:
+                raise ValueError(f"Unsupported gate function: {self.gate_fn}")
+
         o = o.reshape(batch_size, q_len, -1)
         o = self.o_proj(o)
 

@@ -28,7 +28,7 @@ from fla.utils import autotune_cache_kwargs, get_multiprocessor_count, input_gua
 )
 @triton.autotune(
     configs=[triton.Config({"BT": BT}, num_warps=num_warps) for BT in [16, 32, 64] for num_warps in [4, 8, 16]],
-    key=["D", "NB", "IS_RMS_NORM", "STORE_RESIDUAL_OUT", "HAS_RESIDUAL", "HAS_WEIGHT"],
+    key=["D", "NB", "IS_RMS_NORM", "STORE_RESIDUAL_OUT", "HAS_RESIDUAL", "HAS_WEIGHT", "ZERO_CENTERED_GAMMA"],
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -54,6 +54,7 @@ def layer_norm_gated_fwd_kernel(
     HAS_RESIDUAL: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    ZERO_CENTERED_GAMMA: tl.constexpr = False,
 ):
     i_t = tl.program_id(0)
 
@@ -87,7 +88,13 @@ def layer_norm_gated_fwd_kernel(
     if HAS_BIAS:
         b_b = tl.load(b + o_d, mask=m_d).to(tl.float32)
     b_x_hat = (b_x - b_mean[:, None]) * b_rstd[:, None] if not IS_RMS_NORM else b_x * b_rstd[:, None]
-    b_y = b_x_hat * b_w[None, :] if HAS_WEIGHT else b_x_hat
+    if HAS_WEIGHT:
+        if ZERO_CENTERED_GAMMA:
+            b_y = b_x_hat * (1.0 + b_w[None, :])
+        else:
+            b_y = b_x_hat * b_w[None, :]
+    else:
+        b_y = b_x_hat
     if HAS_BIAS:
         b_y = b_y + b_b[None, :]
 
@@ -114,7 +121,7 @@ def layer_norm_gated_fwd_kernel(
 )
 @triton.autotune(
     configs=[triton.Config({}, num_warps=num_warps) for num_warps in [2, 4, 8, 16]],
-    key=["D", "IS_RMS_NORM", "STORE_RESIDUAL_OUT", "HAS_RESIDUAL", "HAS_WEIGHT"],
+    key=["D", "IS_RMS_NORM", "STORE_RESIDUAL_OUT", "HAS_RESIDUAL", "HAS_WEIGHT", "ZERO_CENTERED_GAMMA"],
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -137,6 +144,7 @@ def layer_norm_gated_fwd_kernel1(
     HAS_RESIDUAL: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    ZERO_CENTERED_GAMMA: tl.constexpr = False,
 ):
     i_t = tl.program_id(0)
     x += i_t * D
@@ -170,7 +178,13 @@ def layer_norm_gated_fwd_kernel1(
     if HAS_BIAS:
         b_b = tl.load(b + o_d, mask=m_d).to(tl.float32)
     b_x_hat = (b_x - b_mean) * b_rstd if not IS_RMS_NORM else b_x * b_rstd
-    b_y = b_x_hat * b_w if HAS_WEIGHT else b_x_hat
+    if HAS_WEIGHT:
+        if ZERO_CENTERED_GAMMA:
+            b_y = b_x_hat * (1.0 + b_w)
+        else:
+            b_y = b_x_hat * b_w
+    else:
+        b_y = b_x_hat
     if HAS_BIAS:
         b_y = b_y + b_b
 
@@ -195,7 +209,7 @@ def layer_norm_gated_fwd_kernel1(
 )
 @triton.autotune(
     configs=[triton.Config({"BT": BT}, num_warps=num_warps) for BT in [16, 32, 64] for num_warps in [4, 8, 16]],
-    key=["D", "NB", "IS_RMS_NORM", "HAS_DRESIDUAL", "HAS_WEIGHT"],
+    key=["D", "NB", "IS_RMS_NORM", "HAS_DRESIDUAL", "HAS_WEIGHT", "ZERO_CENTERED_GAMMA"],
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -227,6 +241,7 @@ def layer_norm_gated_bwd_kernel(
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     RECOMPUTE_OUTPUT: tl.constexpr,
+    ZERO_CENTERED_GAMMA: tl.constexpr = False,
 ):
     i_s = tl.program_id(0)
     o_d = tl.arange(0, BD)
@@ -263,7 +278,13 @@ def layer_norm_gated_bwd_kernel(
         b_xhat = (b_x - b_mean[:, None]) * b_rstd[:, None] if not IS_RMS_NORM else b_x * b_rstd[:, None]
         b_xhat = tl.where(m_d[None, :], b_xhat, 0.0)
 
-        b_y = b_xhat * b_w[None, :] if HAS_WEIGHT else b_xhat
+        if HAS_WEIGHT:
+            if ZERO_CENTERED_GAMMA:
+                b_y = b_xhat * (1.0 + b_w[None, :])
+            else:
+                b_y = b_xhat * b_w[None, :]
+        else:
+            b_y = b_xhat
         if HAS_BIAS:
             b_y = b_y + b_b[None, :]
         if RECOMPUTE_OUTPUT:
@@ -284,7 +305,10 @@ def layer_norm_gated_bwd_kernel(
             # mask to this program's upper bound to avoid double-counting dw/db.
             m_t = (i_t + tl.arange(0, BT)) < min(i_s * BS + BS, T)
         if HAS_WEIGHT:
-            b_wdy = b_dy * b_w
+            if ZERO_CENTERED_GAMMA:
+                b_wdy = b_dy * (1.0 + b_w)
+            else:
+                b_wdy = b_dy * b_w
             b_dw += tl.where(m_t[:, None], b_dy * b_xhat, 0.0)
         if HAS_BIAS:
             b_db += tl.where(m_t[:, None], b_dy, 0.0)
@@ -323,7 +347,7 @@ def layer_norm_gated_bwd_kernel(
 )
 @triton.autotune(
     configs=[triton.Config({}, num_warps=num_warps) for num_warps in [2, 4, 8, 16]],
-    key=["D", "IS_RMS_NORM", "STORE_DRESIDUAL", "HAS_DRESIDUAL", "HAS_WEIGHT"],
+    key=["D", "IS_RMS_NORM", "STORE_DRESIDUAL", "HAS_DRESIDUAL", "HAS_WEIGHT", "ZERO_CENTERED_GAMMA"],
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -353,6 +377,7 @@ def layer_norm_gated_bwd_kernel1(
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     RECOMPUTE_OUTPUT: tl.constexpr,
+    ZERO_CENTERED_GAMMA: tl.constexpr = False,
 ):
     i_s = tl.program_id(0)
     o_d = tl.arange(0, BD)
@@ -388,7 +413,13 @@ def layer_norm_gated_bwd_kernel1(
         b_xhat = (b_x - b_mean) * b_rstd if not IS_RMS_NORM else b_x * b_rstd
         b_xhat = tl.where(mask, b_xhat, 0.0)
 
-        b_y = b_xhat * b_w if HAS_WEIGHT else b_xhat
+        if HAS_WEIGHT:
+            if ZERO_CENTERED_GAMMA:
+                b_y = b_xhat * (1.0 + b_w)
+            else:
+                b_y = b_xhat * b_w
+        else:
+            b_y = b_xhat
         if HAS_BIAS:
             b_y = b_y + b_b
         if RECOMPUTE_OUTPUT:
@@ -403,7 +434,10 @@ def layer_norm_gated_bwd_kernel1(
             b_dy = b_dy * b_sigmoid_g
         b_wdy = b_dy
         if HAS_WEIGHT:
-            b_wdy = b_dy * b_w
+            if ZERO_CENTERED_GAMMA:
+                b_wdy = b_dy * (1.0 + b_w)
+            else:
+                b_wdy = b_dy * b_w
             b_dw += b_dy * b_xhat
         if HAS_BIAS:
             b_db += b_dy
@@ -451,6 +485,7 @@ def layer_norm_gated_fwd(
     out_dtype: torch.dtype = None,
     residual_dtype: torch.dtype = None,
     is_rms_norm: bool = False,
+    zero_centered_gamma: bool = False,
 ):
     if residual is not None:
         residual_dtype = residual.dtype
@@ -502,6 +537,7 @@ def layer_norm_gated_fwd(
             NB=NB,
             ACTIVATION=activation,
             IS_RMS_NORM=is_rms_norm,
+            ZERO_CENTERED_GAMMA=zero_centered_gamma,
         )
     else:
         layer_norm_gated_fwd_kernel1[(T,)](
@@ -519,6 +555,7 @@ def layer_norm_gated_fwd(
             BD=BD,
             ACTIVATION=activation,
             IS_RMS_NORM=is_rms_norm,
+            ZERO_CENTERED_GAMMA=zero_centered_gamma,
         )
     # residual_out is None if residual is None and residual_dtype == input_dtype
     return y, mean, rstd, residual_out if residual_out is not None else x
@@ -539,6 +576,7 @@ def layer_norm_gated_bwd(
     is_rms_norm: bool = False,
     x_dtype: torch.dtype = None,
     recompute_output: bool = False,
+    zero_centered_gamma: bool = False,
 ):
     T, D = x.shape
     assert dy.shape == (T, D)
@@ -598,6 +636,7 @@ def layer_norm_gated_bwd(
             ACTIVATION=activation,
             IS_RMS_NORM=is_rms_norm,
             STORE_DRESIDUAL=dresidual_in is not None,
+            ZERO_CENTERED_GAMMA=zero_centered_gamma,
         )
     else:
         layer_norm_gated_bwd_kernel1[grid](
@@ -618,6 +657,7 @@ def layer_norm_gated_bwd(
             T=T,
             D=D,
             BS=BS,
+            ZERO_CENTERED_GAMMA=zero_centered_gamma,
             BD=BD,
             ACTIVATION=activation,
             IS_RMS_NORM=is_rms_norm,
@@ -646,6 +686,7 @@ class LayerNormGatedFunction(torch.autograd.Function):
         prenorm: bool = False,
         residual_in_fp32: bool = False,
         is_rms_norm: bool = False,
+        zero_centered_gamma: bool = False,
     ):
         x_shape_og = x.shape
         g_shape_og = g.shape
@@ -666,6 +707,7 @@ class LayerNormGatedFunction(torch.autograd.Function):
             residual=residual,
             residual_dtype=residual_dtype,
             is_rms_norm=is_rms_norm,
+            zero_centered_gamma=zero_centered_gamma,
         )
         ctx.save_for_backward(residual_out, g, weight, bias, mean, rstd)
         ctx.x_shape_og = x_shape_og
@@ -676,6 +718,7 @@ class LayerNormGatedFunction(torch.autograd.Function):
         ctx.has_residual = residual is not None
         ctx.prenorm = prenorm
         ctx.x_dtype = x.dtype
+        ctx.zero_centered_gamma = zero_centered_gamma
         y = y.reshape(x_shape_og)
         return y if not prenorm else (y, residual_out.reshape(x_shape_og))
 
@@ -705,6 +748,7 @@ class LayerNormGatedFunction(torch.autograd.Function):
             has_residual=ctx.has_residual,
             is_rms_norm=ctx.is_rms_norm,
             x_dtype=ctx.x_dtype,
+            zero_centered_gamma=ctx.zero_centered_gamma,
         )
         return (
             dx.reshape(ctx.x_shape_og),
@@ -717,6 +761,7 @@ class LayerNormGatedFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,  # zero_centered_gamma
         )
 
 
@@ -853,6 +898,7 @@ def rms_norm_gated(
     prenorm: bool = False,
     residual_in_fp32: bool = False,
     eps: float = 1e-6,
+    zero_centered_gamma: bool = False,
 ):
     return LayerNormGatedFunction.apply(
         x,
@@ -865,6 +911,7 @@ def rms_norm_gated(
         prenorm,
         residual_in_fp32,
         True,
+        zero_centered_gamma,
     )
 
 
@@ -996,6 +1043,7 @@ class FusedRMSNormGated(nn.Module):
         elementwise_affine: bool = True,
         eps: float = 1e-5,
         activation: str = "swish",
+        zero_centered_gamma: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> FusedRMSNormGated:
@@ -1006,6 +1054,7 @@ class FusedRMSNormGated(nn.Module):
         self.elementwise_affine = elementwise_affine
         self.eps = eps
         self.activation = activation
+        self.zero_centered_gamma = zero_centered_gamma
 
         if self.activation not in ["swish", "silu", "sigmoid"]:
             raise ValueError(f"Unsupported activation: {self.activation}")
@@ -1020,7 +1069,10 @@ class FusedRMSNormGated(nn.Module):
 
     def reset_parameters(self):
         if self.elementwise_affine:
-            nn.init.ones_(self.weight)
+            if self.zero_centered_gamma:
+                nn.init.zeros_(self.weight)
+            else:
+                nn.init.ones_(self.weight)
 
     def __repr__(self) -> str:
         s = f"{self.__class__.__name__}({self.hidden_size}"
@@ -1028,6 +1080,8 @@ class FusedRMSNormGated(nn.Module):
             s += f", elementwise_affine={self.elementwise_affine}"
         s += f", eps={self.eps}"
         s += f", activation={self.activation}"
+        if self.zero_centered_gamma:
+            s += f", zero_centered_gamma={self.zero_centered_gamma}"
         s += ")"
         return s
 
@@ -1049,6 +1103,7 @@ class FusedRMSNormGated(nn.Module):
             eps=self.eps,
             prenorm=prenorm,
             residual_in_fp32=residual_in_fp32,
+            zero_centered_gamma=self.zero_centered_gamma,
         )
 
 
